@@ -337,8 +337,7 @@ func main() {
 
 	// load previous tweets
 	dumper := downloading.NewDumper()
-	err = dumper.Load(pathHelper.errorj)
-	if err != nil {
+	if err = loadRetryQueue(dumper, pathHelper.errorj); err != nil {
 		log.Fatalln("failed to load previous tweets", err)
 	}
 	log.Infoln("loaded previous failed tweets:", dumper.Count())
@@ -370,29 +369,42 @@ func main() {
 		}
 	}()
 
-	// dump failed tweets at exit
+	// Persist this run's failed tweets and only then advance the timeline
+	// watermarks. Runs last (LIFO: after the retry defer below) so that the
+	// retry pass has already updated the dumper.
+	//
+	// Cancellation must never skip this: the watermarks are advanced below, so
+	// a queue that was not written would leave those tweets unreachable
+	// forever. Skipping the retry *attempt* is fine; skipping the *save* is not.
 	var todump = make([]*downloading.TweetInEntity, 0)
 	defer func() {
+		log.Infof("saving %d failed tweets to the retry queue", dumper.Count())
 		if err := dumper.Dump(pathHelper.errorj); err != nil {
-			log.Errorln("failed to save failed tweet queue:", err)
+			// Do not advance the watermarks past tweets we failed to persist.
+			log.Errorln("failed to save failed tweet queue, keeping timeline watermarks:", err)
 			return
 		}
-		log.Infof("%d tweets have been dumped and will be downloaded the next time the program runs", dumper.Count())
 		if err := downloading.CommitPersistedRetryProgress(db, todump); err != nil {
 			log.Errorln("retry queue was saved, but failed to advance persisted timeline watermarks:", err)
 		}
 	}()
 
-	// retry failed tweets at exit
+	// Re-queue this run's failed tweets, then opportunistically retry them.
 	defer func() {
 		for _, te := range todump {
 			dumper.Push(te.Entity.Id(), te.Tweet)
 		}
-		// 如果手动取消，不尝试重试，快速终止进程
-		if ctx.Err() != context.Canceled && !noRetry {
-			if err := retryFailedTweets(ctx, dumper, db, client); err != nil {
-				log.Errorln("failed to retry previously failed tweets:", err)
+
+		// A manual cancellation skips the retry *attempt* only. The tweets were
+		// pushed above and are still dumped by the deferred save below.
+		if ctx.Err() != nil || noRetry {
+			if dumper.Count() != 0 {
+				log.Infof("%d failed tweets were queued and will be retried on the next run", dumper.Count())
 			}
+			return
+		}
+		if err := retryFailedTweets(ctx, dumper, db, client); err != nil {
+			log.Errorln("failed to retry previously failed tweets:", err)
 		}
 	}()
 
@@ -407,6 +419,24 @@ func main() {
 	if err != nil {
 		log.Errorln("failed to download:", err)
 	}
+}
+
+// loadRetryQueue loads the persisted retry queue. A queue damaged by an earlier
+// interrupted or out-of-space write is moved aside instead of being fatal: a
+// manual fix would otherwise be the only way to start the program again, and the
+// user would lose the queue regardless.
+func loadRetryQueue(dumper *downloading.TweetDumper, path string) error {
+	err := dumper.Load(path)
+	if err == nil || os.IsNotExist(err) {
+		return nil
+	}
+
+	broken := path + ".corrupt"
+	if renameErr := os.Rename(path, broken); renameErr != nil {
+		return fmt.Errorf("unreadable retry queue (%w) and failed to move it aside: %v", err, renameErr)
+	}
+	log.WithError(err).Warnln("retry queue was unreadable and has been moved to", broken, "- starting with an empty queue")
+	return nil
 }
 
 func setClientLogger(client *resty.Client, out io.Writer) {

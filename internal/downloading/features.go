@@ -685,10 +685,27 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 		}
 
 		// 确保该用户所有推文已推送并更新用户推文状态
+		unsent := len(tweets)
+		// 若推送途中被取消，剩余推文既不会进入 tweetChan，也不会出现在失败
+		// 清单里。既然本轮水位线不会推进、这些推文稍后必然会被重新拉取，
+		// 不如直接交给重试队列，免得这次失败的运行静默漏报这部分。
+		// 该 defer 注册晚于 prodwg.Done()，因此先于它执行，且此时
+		// errChan 尚未关闭（要等 conswg.Wait()）。
+		defer func() {
+			for _, tw := range tweets[len(tweets)-unsent:] {
+				pt := TweetInEntity{Tweet: tw, Entity: entity}
+				select {
+				case errChan <- &pt:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
 		for _, tw := range tweets {
 			pt := TweetInEntity{Tweet: tw, Entity: entity}
 			select {
 			case tweetChan <- &pt:
+				unsent--
 			case <-ctx.Done():
 				return // 防止无消费者导致死锁
 			}

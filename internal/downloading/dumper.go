@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/jmoiron/sqlx"
 	log "github.com/sirupsen/logrus"
@@ -71,12 +72,49 @@ func (td *TweetDumper) Load(path string) error {
 	return nil
 }
 
+// Dump writes the retry queue atomically: the data lands in a temporary file in
+// the same directory and is renamed over the target only after it has been
+// fully written and synced. A plain os.WriteFile would truncate the existing
+// queue first, so any write failure (a full disk, most commonly) would destroy
+// the failed-tweet list while the timeline watermarks had already advanced past
+// exactly those tweets -- leaving them unreachable forever.
 func (td *TweetDumper) Dump(path string) error {
 	data, err := json.MarshalIndent(td.data, "", "    ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0666)
+
+	tempFile, err := os.CreateTemp(filepath.Dir(path), ".errors-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := tempFile.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = tempFile.Close()
+		}
+		_ = os.Remove(tempPath)
+	}()
+
+	if _, err := tempFile.Write(data); err != nil {
+		return err
+	}
+	// Flush to stable storage before the rename; otherwise a power loss can
+	// leave a zero-length queue at the final path.
+	if err := tempFile.Sync(); err != nil {
+		return err
+	}
+	if err := tempFile.Close(); err != nil {
+		closed = true
+		return err
+	}
+	closed = true
+
+	if err := os.Chmod(tempPath, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
 }
 
 func (td *TweetDumper) Clear() {
