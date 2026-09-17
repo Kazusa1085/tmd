@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -36,7 +38,13 @@ type Cookie struct {
 }
 
 type Config struct {
-	RootPath           string `yaml:"root_path"`
+	RootPath string `yaml:"root_path"`
+	// StatePath is where the program keeps its own bookkeeping (the SQLite
+	// database and the failed-tweet queue). It defaults to <root_path>/.data.
+	// Pointing it at a local volume is the safe choice when the media live on a
+	// network share: SQLite needs reliable file locking, which NFS and SMB do
+	// not provide.
+	StatePath          string `yaml:"state_path"`
 	Cookie             Cookie `yaml:"cookie"`
 	MaxDownloadRoutine int    `yaml:"max_download_routine"`
 }
@@ -279,31 +287,55 @@ type storePath struct {
 	errorj string
 }
 
-func newStorePath(root string) (*storePath, error) {
+// newStorePath lays out the media root and the state directory and verifies
+// that both can actually be written to. Failing here, with the offending path
+// and the current UID, is far easier to act on than a permission error surfacing
+// later as "failed to save failed tweet queue".
+func newStorePath(root, stateDir string) (*storePath, error) {
+	if root == "" {
+		return nil, errors.New("root_path is empty; set it in conf.yaml")
+	}
+	if stateDir == "" {
+		stateDir = filepath.Join(root, ".data")
+	}
+
 	ph := storePath{}
 	ph.root = root
 	ph.users = filepath.Join(root, "users")
-	ph.data = filepath.Join(root, ".data")
-
+	ph.data = stateDir
 	ph.db = filepath.Join(ph.data, "foo.db")
 	ph.errorj = filepath.Join(ph.data, "errors.json")
 
-	// ensure folder exist
-	err := os.Mkdir(ph.root, 0755)
-	if err != nil && !os.IsExist(err) {
-		return nil, err
-	}
-
-	err = os.Mkdir(ph.users, 0755)
-	if err != nil && !os.IsExist(err) {
-		return nil, err
-	}
-
-	err = os.Mkdir(ph.data, 0755)
-	if err != nil && !os.IsExist(err) {
-		return nil, err
+	for _, dir := range []string{ph.root, ph.users, ph.data} {
+		// MkdirAll, not Mkdir: a parent that already exists is not an error,
+		// and nested paths are legitimate.
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("cannot create %s: %w%s", dir, err, writableHint(dir))
+		}
+		if err := checkWritable(dir); err != nil {
+			return nil, err
+		}
 	}
 	return &ph, nil
+}
+
+// writableHint explains, for a failed directory creation, what to check.
+func writableHint(dir string) string {
+	return fmt.Sprintf(" (running as uid=%d; a bind-mounted directory must already exist and be writable by that uid, or set user: in docker compose)", os.Getuid())
+}
+
+// checkWritable proves the directory accepts a file, which is what the run
+// actually needs. A directory can exist and still be read-only, and the mount
+// may be full.
+func checkWritable(dir string) error {
+	probe, err := os.CreateTemp(dir, ".tmd-write-test-*")
+	if err != nil {
+		return fmt.Errorf("cannot write to %s: %w%s", dir, err, writableHint(dir))
+	}
+	name := probe.Name()
+	_ = probe.Close()
+	_ = os.Remove(name)
+	return nil
 }
 
 func initLogger(dbg bool, logFile io.Writer) {
@@ -426,7 +458,7 @@ func run() int {
 	}
 
 	// ensure store path exist
-	pathHelper, err := newStorePath(conf.RootPath)
+	pathHelper, err := newStorePath(conf.RootPath, conf.StatePath)
 	if err != nil {
 		log.Fatalln("failed to make store dir:", err)
 	}
@@ -664,13 +696,29 @@ func connectDatabase(path string) (*sqlx.DB, error) {
 		return nil, err
 	}
 
-	dsn := fmt.Sprintf("file:%s?_journal_mode=WAL&busy_timeout=2147483647", path)
+	// The path is parsed as a URI when it is prefixed with "file:", so a path
+	// containing '?' or '#' would silently open a different database. Escape it
+	// and pass the options as a query.
+	//
+	// journal_mode=DELETE, not WAL: this is a single-writer program, so WAL
+	// buys little, while it requires the -wal/-shm files to share a filesystem
+	// and does not work on network shares at all. DELETE journals work
+	// everywhere.
+	//
+	// busy_timeout is bounded: the previous value was effectively infinite,
+	// which turned any lock problem into a silent hang with no error anywhere.
+	dsn := fmt.Sprintf("file:%s?_journal_mode=DELETE&busy_timeout=30000&_foreign_keys=on",
+		url.PathEscape(path))
 	db, err := sqlx.Connect("sqlite3", dsn)
 	if err != nil {
 		return nil, err
 	}
-	database.CreateTables(db)
-	//db.SetMaxOpenConns(1)
+	if err := database.CreateTables(db); err != nil {
+		// Ignoring this left a schema problem to surface later as unrelated
+		// write failures on a database that was never usable.
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to prepare the database schema: %w", err)
+	}
 	if !ex {
 		log.Debugln("created new db file", path)
 	}
