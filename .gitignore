@@ -4,3 +4,4 @@ bin
 *.prof
 todo.md
 .tmd-*/
+tmd-image-*.tar*
