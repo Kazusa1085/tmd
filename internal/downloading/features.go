@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -141,19 +143,55 @@ func hasValidMP4FileTypeBox(body []byte) bool {
 	return boxSize >= headerSize+4 && boxSize <= uint64(len(body))
 }
 
+// mediaFileName is the on-disk name of the n-th attachment of a tweet:
+// "01.jpg", "02.mp4". Zero padded so that a plain directory listing is in
+// gallery order, and derived only from the index so that retrying a tweet
+// overwrites its own files instead of accumulating "(1)" copies.
+func mediaFileName(index int, ext string) string {
+	if ext == "" {
+		// Keep the bytes rather than guessing wrong: some URLs carry no usable
+		// extension, and validateMediaResponse has already confirmed the type.
+		ext = ".bin"
+	}
+	return fmt.Sprintf("%02d%s", index, ext)
+}
+
+// writeCaption stores the tweet body as plain UTF-8 text.
+func writeCaption(path, text string) error {
+	_, err := writeMediaFileAtomically(path, strings.NewReader(text), time.Time{})
+	return err
+}
+
+// tweetMeta is the per-tweet index entry. It is what makes the archive
+// self-describing: the id, author, time and original text are all recoverable
+// without touching the network again.
+type tweetMeta struct {
+	Id        uint64    `json:"id"`
+	Url       string    `json:"url,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	Author    *struct {
+		Id         uint64 `json:"id"`
+		Name       string `json:"name"`
+		ScreenName string `json:"screen_name"`
+	} `json:"author,omitempty"`
+	Account string          `json:"account,omitempty"`
+	Media   []twitter.Media `json:"media"`
+}
+
 // Permanently unavailable attachments must not block later media.
-// TODO: make retryable multi-attachment downloads idempotent.
 func downloadTweetMedia(ctx context.Context, client *resty.Client, dir string, tweet *twitter.Tweet) error {
-	text := utils.WinFileName(tweet.Text)
+	// Each tweet gets its own directory named after its id. That removes the
+	// tweet text from the path entirely, which is what used to make long names
+	// fail and made every collision need a "(n)" copy.
+	tweetDir := filepath.Join(dir, strconv.FormatUint(tweet.Id, 10))
+	if err := os.MkdirAll(tweetDir, 0755); err != nil {
+		return err
+	}
 
-	for i, u := range tweet.Urls {
-		ext, err := utils.GetExtFromUrl(u)
-		if err != nil {
-			return err
-		}
-
-		// 请求
-		resp, err := client.R().SetContext(ctx).SetQueryParam("name", "4096x4096").Get(u)
+	written := 0
+	metas := make([]twitter.Media, 0, len(tweet.Media))
+	for _, m := range tweet.Media {
+		resp, err := client.R().SetContext(ctx).SetQueryParam("name", "4096x4096").Get(m.Url)
 		if err == nil && resp == nil {
 			err = errors.New("media request returned no response")
 		} else if err == nil {
@@ -165,30 +203,76 @@ func downloadTweetMedia(ctx context.Context, client *resty.Client, dir string, t
 				unavailable = unavailable || resp.StatusCode() == 403 || resp.StatusCode() == 404
 			}
 			if unavailable {
+				// TODO: only 404 is certainly permanent; a 403 is often a stale
+				// signed URL that would work on a later attempt.
 				log.WithFields(log.Fields{
 					"tweet_id":         tweet.Id,
-					"attachment_index": i + 1,
+					"attachment_index": m.Index,
 				}).Warnln("media attachment is unavailable; continuing with remaining attachments")
 				continue
 			}
 			return err
 		}
-		if err := validateMediaResponse(resp, ext); err != nil {
+		if err := validateMediaResponse(resp, m.Extension); err != nil {
 			log.WithError(err).WithFields(log.Fields{
 				"tweet_id":         tweet.Id,
-				"attachment_index": i + 1,
-				"url":              u,
+				"attachment_index": m.Index,
+				"url":              m.Url,
 			}).Warnln("media response was rejected")
 			return err
 		}
 
-		path := filepath.Join(dir, text+ext)
+		name := mediaFileName(m.Index, m.Extension)
+		path := filepath.Join(tweetDir, name)
 		if _, err := writeMediaFileAtomically(path, bytes.NewReader(resp.Body()), tweet.CreatedAt); err != nil {
 			return err
 		}
+		written++
+
+		entry := m
+		entry.Extension = m.Extension
+		metas = append(metas, entry)
 	}
 
-	fmt.Printf("%s %s\n", color.FgLightMagenta.Render("["+tweet.Creator.Title()+"]"), text)
+	// A tweet whose every attachment was unavailable is not really downloaded;
+	// reporting it as such would advance the timeline watermark past media that
+	// was never saved.
+	if written == 0 {
+		return fmt.Errorf("tweet %d: no attachment could be downloaded (%d attempted)", tweet.Id, len(tweet.Media))
+	}
+
+	if err := writeCaption(filepath.Join(tweetDir, "caption.txt"), tweet.FullText()); err != nil {
+		return err
+	}
+
+	meta := tweetMeta{
+		Id:        tweet.Id,
+		CreatedAt: tweet.CreatedAt,
+		Media:     metas,
+	}
+	if author := tweet.Creator; author != nil {
+		meta.Url = fmt.Sprintf("https://x.com/%s/status/%d", author.ScreenName, tweet.Id)
+		meta.Author = &struct {
+			Id         uint64 `json:"id"`
+			Name       string `json:"name"`
+			ScreenName string `json:"screen_name"`
+		}{Id: author.Id, Name: author.Name, ScreenName: author.ScreenName}
+	}
+	if tweet.Account != nil {
+		meta.Account = tweet.Account.Title()
+	}
+
+	// meta.json is written last and is therefore the completion marker: if it
+	// exists, the media and the caption for this tweet are all on disk.
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	if _, err := writeMediaFileAtomically(filepath.Join(tweetDir, "meta.json"), bytes.NewReader(data), tweet.CreatedAt); err != nil {
+		return err
+	}
+
+	fmt.Printf("%s %s\n", color.FgLightMagenta.Render("["+tweet.Creator.Title()+"]"), utils.WinFileName(tweet.FullText()))
 	return nil
 }
 
@@ -249,6 +333,14 @@ func tweetDownloader(client *resty.Client, config *workerConfig, errch chan<- Pa
 		err := downloadTweetMedia(config.ctx, client, path, pt.GetTweet())
 		if err != nil {
 			errch <- pt
+		} else {
+			// Successes travel the same channel as failures: it is the only
+			// place the caller sees every tweet's outcome, which is what the
+			// per-user download counts are derived from.
+			if te, isTweet := pt.(*TweetInEntity); isTweet {
+				te.downloaded = true
+			}
+			errch <- pt
 		}
 
 		// cancel context and exit if no disk space
@@ -293,6 +385,11 @@ func BatchDownloadTweet(ctx context.Context, client *resty.Client, pts ...Packge
 
 	errors := []PackgedTweet{}
 	for pt := range errChan {
+		// Callers of this function want the failures; a tweet that was stored is
+		// reported as such so that it is not queued for retry.
+		if te, isTweet := pt.(*TweetInEntity); isTweet && te.downloaded {
+			continue
+		}
 		errors = append(errors, pt)
 	}
 	return errors
@@ -395,7 +492,18 @@ type TweetInEntity struct {
 	Entity                   *UserEntity
 	pendingLatestReleaseTime time.Time
 	pendingMediaCount        int
+	downloaded               bool
 }
+
+// UserEntityIDs maps a user id to the entity that stores it under the current
+// root. It is filled while downloading so that callers can turn a user back into
+// the entity the per-user statistics are keyed by.
+var UserEntityIDs = make(map[uint64]int)
+
+// DownloadStats records how many tweets were stored per user entity.
+// A tweet counts as stored only after its directory was completed, so the target
+// report can show real numbers instead of a placeholder.
+type DownloadStats map[int]int
 
 // CommitPersistedRetryProgress advances watermarks that were held back until
 // the caller confirmed that the failed tweets were written to its retry queue.
@@ -455,9 +563,10 @@ func shouldIngoreUser(user *twitter.User) bool {
 	return user.Blocking || user.Muting
 }
 
-func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, users []userInLstEntity, dir string, autoFollow bool, additional []*resty.Client) ([]*TweetInEntity, error) {
+func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, users []userInLstEntity, dir string, autoFollow bool, additional []*resty.Client) ([]*TweetInEntity, DownloadStats, error) {
+	stats := DownloadStats{}
 	if len(users) == 0 {
-		return nil, nil
+		return nil, stats, nil
 	}
 
 	uidToUser := make(map[uint64]*twitter.User)
@@ -527,6 +636,7 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 					continue
 				}
 				syncedUsers.Store(user.Id, pathEntity)
+				UserEntityIDs[user.Id] = pathEntity.Id()
 
 				// 同步所有现存的指向此用户的符号链接
 				upath, _ := pathEntity.Path()
@@ -598,7 +708,7 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 	}()
 
 	if userEntityHeap.Empty() {
-		return nil, nil
+		return nil, stats, nil
 	}
 	log.Debugln("preprocessing finish, elapsed:", time.Since(start))
 	log.Debugln("real members:", userEntityHeap.Size())
@@ -685,10 +795,32 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 		}
 
 		// 确保该用户所有推文已推送并更新用户推文状态
+		// 推文属于哪个存档由这里标注：转推时作者与账号不同。
+		for _, tw := range tweets {
+			tw.Account = user
+		}
+
+		unsent := len(tweets)
+		// 若推送途中被取消，剩余推文既不会进入 tweetChan，也不会出现在失败
+		// 清单里。既然本轮水位线不会推进、这些推文稍后必然会被重新拉取，
+		// 不如直接交给重试队列，免得这次失败的运行静默漏报这部分。
+		// 该 defer 注册晚于 prodwg.Done()，因此先于它执行，且此时
+		// errChan 尚未关闭（要等 conswg.Wait()）。
+		defer func() {
+			for _, tw := range tweets[len(tweets)-unsent:] {
+				pt := TweetInEntity{Tweet: tw, Entity: entity}
+				select {
+				case errChan <- &pt:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
 		for _, tw := range tweets {
 			pt := TweetInEntity{Tweet: tw, Entity: entity}
 			select {
 			case tweetChan <- &pt:
+				unsent--
 			case <-ctx.Done():
 				return // 防止无消费者导致死锁
 			}
@@ -716,7 +848,7 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 
 	producerPool, err := ants.NewPool(min(userTweetMaxConcurrent, userEntityHeap.Size()))
 	if err != nil {
-		return nil, err
+		return nil, stats, err
 	}
 	defer ants.Release()
 	submitProducer := func(entity *UserEntity) error {
@@ -786,10 +918,16 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 
 	fails := []*TweetInEntity{}
 	failedProgressByEntity := make(map[int]*TweetInEntity)
+	// The channel carries both outcomes, so the successes can be counted here
+	// without a second pass over the downloaded files.
 	for pt := range errChan {
 		failed := pt.(*TweetInEntity)
-		fails = append(fails, failed)
 		entityID := failed.Entity.Id()
+		if failed.downloaded {
+			stats[entityID]++
+			continue
+		}
+		fails = append(fails, failed)
 		if _, exists := failedProgressByEntity[entityID]; !exists {
 			failedProgressByEntity[entityID] = failed
 		}
@@ -811,26 +949,26 @@ func BatchUserDownload(ctx context.Context, client *resty.Client, db *sqlx.DB, u
 			continue
 		}
 		if err := database.UpdateUserEntityTweetStat(db, entityID, pending.latest, pending.mediaCount); err != nil {
-			return fails, fmt.Errorf("failed to commit timeline watermark for user %s: %w", pending.entity.Name(), err)
+			return fails, stats, fmt.Errorf("failed to commit timeline watermark for user %s: %w", pending.entity.Name(), err)
 		}
 	}
 	log.Debugf("%d users unable to start", userEntityHeap.Size())
-	return fails, cause
+	return fails, stats, cause
 }
 
-func downloadList(ctx context.Context, client *resty.Client, db *sqlx.DB, list twitter.ListBase, dir string, realDir string, autoFollow bool, additional []*resty.Client) ([]*TweetInEntity, error) {
+func downloadList(ctx context.Context, client *resty.Client, db *sqlx.DB, list twitter.ListBase, dir string, realDir string, autoFollow bool, additional []*resty.Client) ([]*TweetInEntity, DownloadStats, error) {
 	expectedTitle := utils.WinFileName(list.Title())
 	entity, err := NewListEntity(db, list.GetId(), dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := syncPath(entity, expectedTitle); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	members, err := list.GetMembers(ctx, client)
 	if err != nil || len(members) == 0 {
-		return nil, err
+		return nil, nil, err
 	}
 
 	eid := entity.Id()
@@ -853,11 +991,11 @@ func syncList(db *sqlx.DB, list *twitter.List) error {
 	return database.UpdateLst(db, &database.Lst{Id: list.Id, Name: list.Name, OwnerId: list.Creator.Id})
 }
 
-func DownloadList(ctx context.Context, client *resty.Client, db *sqlx.DB, list twitter.ListBase, dir string, realDir string, autoFollow bool, additional []*resty.Client) ([]*TweetInEntity, error) {
+func DownloadList(ctx context.Context, client *resty.Client, db *sqlx.DB, list twitter.ListBase, dir string, realDir string, autoFollow bool, additional []*resty.Client) ([]*TweetInEntity, DownloadStats, error) {
 	tlist, ok := list.(*twitter.List)
 	if ok {
 		if err := syncList(db, tlist); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	return downloadList(ctx, client, db, list, dir, realDir, autoFollow, additional)
@@ -895,7 +1033,7 @@ func syncLstAndGetMembers(ctx context.Context, client *resty.Client, db *sqlx.DB
 	return packgedUsers, nil
 }
 
-func BatchDownloadAny(ctx context.Context, client *resty.Client, db *sqlx.DB, lists []twitter.ListBase, users []*twitter.User, dir string, realDir string, autoFollow bool, additional []*resty.Client) ([]*TweetInEntity, error) {
+func BatchDownloadAny(ctx context.Context, client *resty.Client, db *sqlx.DB, lists []twitter.ListBase, users []*twitter.User, dir string, realDir string, autoFollow bool, additional []*resty.Client) ([]*TweetInEntity, DownloadStats, error) {
 	log.Debugln("start collecting users")
 	packgedUsers := make([]userInLstEntity, 0)
 	wg := sync.WaitGroup{}
@@ -919,7 +1057,7 @@ func BatchDownloadAny(ctx context.Context, client *resty.Client, db *sqlx.DB, li
 	}
 	wg.Wait()
 	if err := context.Cause(ctx); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	for _, usr := range users {

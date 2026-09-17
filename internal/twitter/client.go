@@ -2,11 +2,11 @@ package twitter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/unkmonster/tmd/internal/utils"
 )
 
@@ -390,14 +391,88 @@ func ReportRequestCount() {
 	})
 }
 
-var screenNamePattern = regexp.MustCompile(`"screen_name":"(\S+?)"`)
+// initialStateMarker introduces the page's bootstrap state, which X embeds as
+// `window.__INITIAL_STATE__ = {...}` inside the HTML.
+const initialStateMarker = "window.__INITIAL_STATE__"
 
-func extractScreenNameFromHome(home []byte) string {
-	subs := screenNamePattern.FindStringSubmatch(string(home))
-	if len(subs) == 0 {
-		return ""
+// extractInitialState returns the JSON object assigned to __INITIAL_STATE__.
+// It scans for the matching closing brace instead of using a regular
+// expression: the object is large and contains arbitrary script text, so no
+// pattern anchored on `</script>` is reliable.
+func extractInitialState(home string) (string, bool) {
+	at := strings.Index(home, initialStateMarker)
+	if at < 0 {
+		return "", false
 	}
-	return subs[1]
+	start := strings.IndexByte(home[at:], '{')
+	if start < 0 {
+		return "", false
+	}
+	start += at
+
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(home); i++ {
+		c := home[i]
+		switch {
+		case escaped:
+			escaped = false
+		case c == '\\':
+			if inString {
+				escaped = true
+			}
+		case c == '"':
+			inString = !inString
+		case inString:
+			// nothing: braces inside strings do not nest
+		case c == '{':
+			depth++
+		case c == '}':
+			depth--
+			if depth == 0 {
+				return home[start : i+1], true
+			}
+		}
+	}
+	return "", false
+}
+
+// extractScreenNameFromHome returns the screen name of the account the page was
+// rendered for, or an error when the page does not belong to a signed-in user.
+//
+// This deliberately reads the authenticated user out of the page's initial
+// state instead of scanning for the first `"screen_name":"..."` occurrence.
+// A login wall or catch-all page also contains unrelated `screen_name` fields,
+// and matching one of those made an unauthenticated client look like a
+// successful login -- which then surfaced much later as every target failing
+// with an auth error, instead of one clear "the cookie is not valid".
+func extractScreenNameFromHome(home []byte) (string, error) {
+	state, ok := extractInitialState(string(home))
+	if !ok {
+		return "", errors.New("the page has no __INITIAL_STATE__; the cookie was probably rejected")
+	}
+
+	// The session block carries the authenticated user id, but for a guest
+	// session the key is absent entirely (verified against a live response:
+	// anonymous pages have only country/guestId/isLoaded/...). This is the
+	// difference between "signed in" and "served a page anyway".
+	//
+	// Layout, verified against a live response (the state object starts
+	// immediately after the `=`, and `entities` is the outermost key):
+	//   {"optimist":[],"entities":{"users":{"entities":{"<id>":{...,"screen_name":".."}}}},
+	//    "session":{"user_id":"<id>",...}, ...}
+	userID := gjson.Get(state, "session.user_id").String()
+	if userID == "" {
+		return "", errors.New("the page has no signed-in session; the cookie was rejected or has expired")
+	}
+
+	entry := gjson.Get(state, "entities.users.entities."+userID)
+	name := entry.Get("screen_name").String()
+	if name == "" {
+		return "", fmt.Errorf("the signed-in session (%s) has no matching user in the page; the cookie was probably rejected", userID)
+	}
+	return name, nil
 }
 
 func GetSelfScreenName(ctx context.Context, client *resty.Client) (string, error) {
@@ -417,8 +492,7 @@ func GetSelfScreenName(ctx context.Context, client *resty.Client) (string, error
 	if err := utils.CheckRespStatus(resp); err != nil {
 		return "", err
 	}
-	sname := extractScreenNameFromHome(resp.Body())
-	return sname, nil
+	return extractScreenNameFromHome(resp.Body())
 }
 
 func GetClientError(cli *resty.Client) error {

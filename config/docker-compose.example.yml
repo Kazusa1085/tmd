@@ -1,0 +1,62 @@
+# tmd 的 Docker Compose 示例
+#
+# ---------------------------------------------------------------
+# ⚠️ 本文件是【提案中的示例】,依赖尚未实现的功能:
+#      TMD_CONFIG_DIR / --targets / state_path
+#    当前版本可以用的部分:volumes 里的 data 挂载 + command 里的
+#    --user / --list / --foll 参数。
+# ---------------------------------------------------------------
+#
+# 运行方式(推荐:一次性任务,由 NAS 的任务计划器/系统 cron 定时触发)
+#   手动跑一次:  docker compose run --rm tmd
+#   定时触发:    在 NAS 任务计划器里填 `docker compose run --rm tmd`
+#
+# 为什么不把容器做成长驻 + 内置 cron:
+#   程序本身就是"跑完一轮即退出"的形态,做成常驻需要额外处理 PID 1、
+#   cron 日志、时区、崩溃重启,复杂度全上来了却没有收益。
+#   一次性容器还有个好处:每次都是全新进程,不存在跨轮次的状态残留。
+
+services:
+  tmd:
+    image: tmd:latest
+    container_name: tmd
+    restart: "no"          # 一次性任务,不要自动重启
+
+    environment:
+      # 配置目录(conf.yaml / targets.yaml / additional_cookies.yaml / 日志)
+      # 挂载到容器外部,重建容器也不会丢 cookie
+      TMD_CONFIG_DIR: /config
+
+      # 让日志时间戳和数据库时间跟你本地对得上。
+      # 注意:推文发布时间的解析不依赖这个(推文自带时区偏移)。
+      # 镜像里已包含 tzdata,所以这里填了才生效。
+      TZ: Asia/Shanghai
+
+      # 宿主机上 `id -u` / `id -g` 的值。
+      # 不设的话容器以 root 运行,写出来的媒体文件在 NAS 上会归 root 所有,
+      # 你的其他应用可能读不了。设成你自己的 UID:GID 最省事。
+      PUID: "1000"
+      PGID: "1000"
+
+    volumes:
+      # 配置目录 —— 只读就够了?不行,程序要写日志和报告,所以是读写
+      - /volume1/docker/tmd/config:/config
+
+      # 媒体目录 —— 这个是你真正在乎的数据
+      - /volume1/media/tmd:/data
+
+      # 程序状态(SQLite 库 + 重试队列)。
+      # 【强烈建议指向本地卷】不要指向网络共享:
+      # SQLite 依赖可靠的文件锁,NFS/SMB 上会出错甚至损坏数据库。
+      # 即使你不在乎这个库,它损坏也可能让整轮运行失败。
+      - /volume1/docker/tmd/state:/state
+
+    # 不用 --user 的话就在这里写目标,或者依赖 /config/targets.yaml
+    command: ["--targets", "/config/targets.yaml"]
+
+    # 可选:给容器一点资源上限,避免在 NAS 上抢满 CPU
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "2"
+    #       memory: 1g

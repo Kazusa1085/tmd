@@ -72,8 +72,11 @@ CREATE TABLE IF NOT EXISTS user_links (
 CREATE INDEX IF NOT EXISTS idx_user_links_user_id ON user_links (user_id);
 `
 
-func CreateTables(db *sqlx.DB) {
-	db.MustExec(schema)
+func CreateTables(db *sqlx.DB) error {
+	// Return the error instead of panicking: the caller reports it together
+	// with the database path, which is what makes it actionable.
+	_, err := db.Exec(schema)
+	return err
 }
 
 func CreateUser(db *sqlx.DB, usr *User) error {

@@ -1,0 +1,19 @@
+# 备用 cookie 示例(additional_cookies.yaml)
+#
+# 放置位置:
+#   1. $TMD_CONFIG_DIR/additional_cookies.yaml
+#   2. $HOME/.tmd2/additional_cookies.yaml
+#
+# 作用:程序会从所有可用 cookie 中挑一个"当前不会被限速"的来拉取推文,
+#       用来提升获取速度和总量,绕开单账号的速率限制。
+# 注意:判断"是否忽略某用户"和"自动关注受保护用户"仍然只用主账号。
+#       这些备用账号只承担拉取媒体的工作。
+#
+# 不想要这个功能就不创建此文件,程序会正常跳过。
+# 文件权限建议 0600(里面有凭据)。
+
+- auth_token: "第一个账号的 auth_token"
+  ct0: "第一个账号的 ct0"
+
+- auth_token: "第二个账号的 auth_token"
+  ct0: "第二个账号的 ct0"

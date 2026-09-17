@@ -35,7 +35,9 @@ func GetUserById(ctx context.Context, client *resty.Client, id uint64) (*User, e
 	getUrl := makeUrl(&api)
 	r, err := getUser(ctx, client, getUrl)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get user [%d]: %v", id, err)
+		// %w, not %v: callers classify the error with errors.As/Is, which does
+		// not see through a %v wrap.
+		return nil, fmt.Errorf("failed to get user [%d]: %w", id, err)
 	}
 	return r, err
 }
@@ -44,7 +46,7 @@ func GetUserByScreenName(ctx context.Context, client *resty.Client, screenName s
 	u := makeUrl(&userByScreenName{screenName: screenName})
 	r, err := getUser(ctx, client, u)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get user [%s]: %v", screenName, err)
+		return nil, fmt.Errorf("failed to get user [%s]: %w", screenName, err)
 	}
 	return r, err
 }

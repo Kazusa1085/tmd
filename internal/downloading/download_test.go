@@ -1,9 +1,11 @@
 package downloading
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -355,4 +357,85 @@ func generateSomeTweets(n int) []*twitter.Tweet {
 		res = append(res, tw)
 	}
 	return res
+}
+
+// TestDumpIsAtomic pins the invariant that a failed queue write must not
+// destroy the queue that is already on disk. The watermarks of the tweets in
+// that queue have already been advanced, so losing it means losing the media
+// permanently.
+func TestDumpIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "errors.json")
+
+	// An existing queue with one tweet.
+	before := NewDumper()
+	before.Push(1, generateSomeTweets(1)...)
+	if err := before.Dump(path); err != nil {
+		t.Fatalf("initial dump: %v", err)
+	}
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+
+	// A later dump that cannot even be started (no such directory) must fail
+	// without touching the file that is already there.
+	after := NewDumper()
+	after.Push(2, generateSomeTweets(1)...)
+	missing := filepath.Join(dir, "no-such-dir", "errors.json")
+	if err := after.Dump(missing); err == nil {
+		t.Fatal("expected the dump into a missing directory to fail")
+	}
+	current, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the queue disappeared after a failed dump: %v", err)
+	}
+	if !bytes.Equal(original, current) {
+		t.Error("the queue was modified by a failed dump")
+	}
+
+	// A successful dump leaves no temporary files behind and is readable.
+	if err := after.Dump(path); err != nil {
+		t.Fatalf("second dump: %v", err)
+	}
+	assertNoTempFiles(t, dir)
+	loaded := NewDumper()
+	if err := loaded.Load(path); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if loaded.Count() != 1 {
+		t.Errorf("reloaded count = %d, want 1", loaded.Count())
+	}
+}
+
+// TestDumpOverwriteLeavesNoTempFiles covers the repeated-dump path: every run
+// rewrites the queue, so leftovers would accumulate in the state directory.
+func TestDumpOverwriteLeavesNoTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "errors.json")
+
+	d := NewDumper()
+	for i := 0; i < 5; i++ {
+		d.Push(i, generateSomeTweets(2)...)
+		if err := d.Dump(path); err != nil {
+			t.Fatalf("dump %d: %v", i, err)
+		}
+	}
+	assertNoTempFiles(t, dir)
+	if d.Count() != 10 {
+		t.Errorf("count = %d, want 10", d.Count())
+	}
+}
+
+func assertNoTempFiles(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".errors-") {
+			t.Errorf("temporary queue file was not cleaned up: %s", e.Name())
+		}
+	}
 }
