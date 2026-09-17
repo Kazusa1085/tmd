@@ -58,6 +58,12 @@ var targetsPath string
 // name an account even when it was never resolved.
 var targetOrder []targets.Target
 
+// targetLabelByUserID maps a resolved account back to the target that named it.
+// The two labels differ (`@handle` versus the entity's own title), and the
+// per-account statistics are keyed by the entity, so the mapping is needed to
+// attribute them.
+var targetLabelByUserID = make(map[uint64]string)
+
 // targetReport accumulates per-account outcomes for targets_report.tsv.
 var targetReport = report.New()
 
@@ -196,6 +202,7 @@ func resolveTarget(ctx context.Context, client *resty.Client, t targets.Target) 
 	if label != user.Title() {
 		log.Infof("resolved %s -> %s", label, user.Title())
 	}
+	targetLabelByUserID[user.Id] = label
 	return user
 }
 
@@ -544,9 +551,21 @@ func run() int {
 	}
 	log.Infof("start working for: %d user(s), %d list(s)", len(task.users), len(task.lists))
 
-	todump, err = downloading.BatchDownloadAny(ctx, client, db, task.lists, task.users, pathHelper.root, pathHelper.users, autoFollow, addtional)
+	todump, stats, err := downloading.BatchDownloadAny(ctx, client, db, task.lists, task.users, pathHelper.root, pathHelper.users, autoFollow, addtional)
 	if err != nil {
 		log.Errorln("failed to download:", err)
+	}
+
+	// Map the per-entity download counts back onto the targets that were asked
+	// for, so the report shows how much each account actually produced instead
+	// of a placeholder.
+	downloadedByTarget := make(map[string]int, len(task.users))
+	for _, u := range task.users {
+		label, known := targetLabelByUserID[u.Id]
+		eid, hasEntity := downloading.UserEntityIDs[u.Id]
+		if known && hasEntity {
+			downloadedByTarget[label] = stats[eid]
+		}
 	}
 
 	// One outcome per target, so a skipped account can never look like a
@@ -565,7 +584,7 @@ func run() int {
 				fmt.Errorf("%d tweet(s) failed to download and were queued for retry", failed))
 			continue
 		}
-		targetReport.OK(t.Label(), t.Value, 0)
+		targetReport.OK(t.Label(), t.Value, downloadedByTarget[t.Label()])
 	}
 
 	return targetReport.ExitCode()
