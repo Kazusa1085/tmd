@@ -50,10 +50,19 @@ go build .
 
 #### 配置项介绍
 
-1. `storeage path`：存储路径(可以不存在)
+1. `root_path`：媒体存储路径(可以不存在)。引导程序里显示为 `enter storage dir`
 2. `auth_token`：用于登录，[获取方式](https://github.com/unkmonster/tmd/blob/master/doc/help.md#获取-cookie)
 3. `ct0`：用于登录，[获取方式](https://github.com/unkmonster/tmd/blob/master/doc/help.md#获取-cookie)
 4. `max_download_routine`：最大并发下载协程数（如果为0取默认值）
+5. `state_path`（可选）：程序自身状态（数据库、失败重试队列）的存放目录，
+   默认 `<root_path>/.data`
+
+> **`state_path` 建议单独指定到本地磁盘。** 如果你的媒体放在 NAS 共享
+> （NFS/SMB）上，这个目录不要跟着放：SQLite 依赖可靠的文件锁，在网络共享上
+> 会出错甚至损坏数据库。媒体可以放共享，程序状态放本地卷。
+
+配置目录默认是 `$HOME/.tmd2/`（Windows 为 `%appdata%\.tmd2\`），
+可用环境变量 `TMD_CONFIG_DIR` 覆盖——容器部署时用来把配置挂载到外部目录。
 
 #### 更新配置
 
@@ -73,9 +82,69 @@ tmd --user <screen_name>   // 下载由 screen_name 指定的用户的推文
 tmd --list <list_id>       // 批量下载由 list_id 指定的列表中的每个用户
 tmd --foll <user_id>       // 批量下载由 user_id 指定的用户正关注的每个用户
 tmd --foll <screen_name>   // 批量下载由 screen_name 指定的用户正关注的每个用户
+tmd --targets <path>       // 从文件读取要下载的账号列表（默认 <配置目录>/targets.yaml）
 tmd --auto-follow          // 自动关注受保护的用户
 tmd --no-retry             // 仅转储，不在程序退出前自动重试下载失败的推文
 ```
+
+### 批量下载多个用户
+
+把要下载的账号写进 `<配置目录>/targets.yaml`，然后直接运行 `tmd`：
+
+```yaml
+users:
+  - 44196397          # 数字 ID，推荐：账号改名也不会找错人
+  - "@elonmusk"       # handle，需要加引号
+```
+
+也可以继续用 `--user` 写在命令行上，两者会合并并自动去重。
+
+**列表里有账号被封、注销或不可用时，不会中断整个任务**：该账号会被跳过并记录，
+其余账号照常下载。每次运行后在配置目录生成 `targets_report.tsv`，逐条记录结果：
+
+```
+handle     user_id   status   reason        media         detail           last_error
+@elonmusk  44196397  ok                     new_media=42
+someone    1234      skipped  suspended                    user unavailable
+another    5678      failed   rate_limited                                    ...
+```
+
+- `status`：`ok` 成功 / `skipped` 预期内跳过 / `failed` 意外失败
+- `reason`：`suspended`（被封或注销）、`protected`（受保护且未关注）、
+  `blocked`（被你屏蔽或静音）、`rate_limited`、`auth`、`network`、`unknown`
+
+### 退出码
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | 全部成功，或只有预期内的跳过 |
+| `1` | 出现意外失败（网络、限流、写入错误） |
+| `2` | 参数或配置错误 |
+| `3` | 所有目标都因认证失败 → 大概率是 cookie 失效 |
+
+这样任务计划器只在真正需要时报警，不会因为"某个账号被封了"天天打扰你。
+
+### 文件在磁盘上长什么样
+
+每个用户一个目录，**每条推文一个子目录**（子目录名是推文 ID）：
+
+```
+<存储路径>/users/<用户名>/
+└── 1839204812/              推文 ID
+    ├── 01.jpg               附件，按相册原始顺序，零填充
+    ├── 02.mp4
+    ├── caption.txt          推文正文（纯 UTF-8）
+    └── meta.json            推文 ID / 链接 / 发布时间 / 作者 / 附件清单
+```
+
+因此：
+
+- 文件名**不含推文文本**：长推文不会撞上文件名长度上限，重名也不会产生 `(1)` 副本；
+- **同一条推文重试会覆盖自己的文件**，不会重复下载出多余副本；
+- `meta.json` 是**最后写入的**，它存在即代表这条推文已完整落盘，可据此判断完整性；
+- 正文与元数据都在盘上，归档是自描述的，以后重建索引、去重或喂给
+  Immich / PhotoPrism 之类工具都不需要重新联网。
+
 
 > 为了创建符号链接，在 Windows 上应该以管理员身份运行程序
 
@@ -137,6 +206,37 @@ $Env:HTTPS_PROXY="http://127.0.0.1:7890"
   ct0: xxxxxxxxxxxxxxxxxxxxx3
 ```
 > 这些添加的备用 cookie，仅用来提升获取推文的速率和总量。判断是否忽略用户和自动关注受保护的用户依然使用主账号
+
+## Docker / NAS 部署
+
+镜像一次性运行：下载、写报告、退出。**定时任务交给 NAS 的任务计划器或系统 cron**，
+不要让容器常驻（程序本身跑完即退出，常驻需要额外处理 PID 1、cron 日志、时区）。
+
+```bash
+docker build -t tmd .
+
+# 手动跑一次
+docker run --rm \
+  -e TZ=Asia/Shanghai \
+  -v /volume1/docker/tmd/config:/config \
+  -v /volume1/docker/tmd/state:/state \
+  -v /volume1/media/tmd:/data \
+  tmd
+```
+
+`docker/entrypoint.sh` 会在启动时检查配置是否挂载、目录是否可写，并给出可操作的
+提示，而不是等到后面报一个和真正原因无关的错误。
+
+三个挂载点的分工：
+
+| 挂载点 | 内容 | 建议位置 |
+|---|---|---|
+| `/config` | `conf.yaml`、`targets.yaml`、`additional_cookies.yaml`、日志、报告 | 容器配置目录 |
+| `/state` | 数据库、失败重试队列 | **本地卷**（SQLite 需要可靠文件锁） |
+| `/data` | 媒体文件 | 可以放共享，`conf.yaml` 里 `root_path` 指向它 |
+
+`config/` 目录下有完整的示例配置与 compose 文件。相关环境变量：`TMD_CONFIG_DIR`
+（配置目录，镜像里默认 `/config`）、`TZ`（日志时区）。
 
 ## Detail
 

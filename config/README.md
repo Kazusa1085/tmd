@@ -1,13 +1,9 @@
 # 配置与部署示例
 
-> ⚠️ **这里的示例是设计方案的一部分,尚未实现。**
-> 当前仓库版本能直接用的只有 `conf.example.yaml` 里的
-> `root_path` / `cookie` / `max_download_routine`,以及命令行参数
-> `--user` / `--list` / `--foll`。
-> `TMD_CONFIG_DIR`、`targets.yaml`、`--targets`、`state_path`、
-> `targets_report.tsv` 都需要先按《改造方案》实现。
->
-> 这个目录的作用是:**把方案固化下来,不依赖聊天记录**。
+> ✅ **这些示例对应当前实现。**
+> `--targets`、`targets.yaml`、`targets_report.tsv`、`TMD_CONFIG_DIR`、
+> `state_path`、退出码都已落地并经过实跑验证。
+> 部署方式见仓库根的 `readme.md` 与 `Dockerfile`、`docker/entrypoint.sh`。
 
 ## 文件说明
 
@@ -124,7 +120,7 @@ someone	1234	skipped	suspended	user unavailable: __typename is UserUnavailable
 > 退出码是给你接监控用的:任务计划器可以据此报警,
 > 而"某人被封了"这种正常的跳过不会天天吵你。
 
-## 实现时要落地的决定(备忘)
+## 已落地的决定
 
 1. **数据库**:`journal_mode=DELETE`(不用 WAL),`busy_timeout` 30 秒,
    DSN 做 URI 转义,错误必须可见不能静默吞。
@@ -137,8 +133,13 @@ someone	1234	skipped	suspended	user unavailable: __typename is UserUnavailable
 7. **推文目录布局**(媒体侧):
    ```
    <root_path>/users/<用户目录>/<推文ID>/
-       caption.txt    纯正文,UTF-8 无 BOM
-       meta.json      id/created_at/text/url/author/media[]
        01.jpg         按相册原始顺序,零填充
+       caption.txt    纯正文,UTF-8
+       meta.json      id/url/created_at/author/account/media[]
    ```
    `meta.json` **最后写**,作为"这条推文下载完整"的标记。
+8. **登录校验**:从页面 `__INITIAL_STATE__` 的 `session.user_id` 判定是否已登录,
+   不靠正则抓 `"screen_name"`(匿名页面里也有该字段,会导致假 cookie 被当成登录成功)。
+9. **目标失败分类**:`suspended` / `protected` / `blocked` 属预期内跳过(退出码 0),
+   `rate_limited` / `auth` / `network` / `unknown` 计为意外失败(退出码 1;
+   全部为 `auth` 时退出码 3)。
