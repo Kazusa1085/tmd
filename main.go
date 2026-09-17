@@ -148,21 +148,6 @@ type Task struct {
 	lists []twitter.ListBase
 }
 
-func printTask(task *Task) {
-	if len(task.users) != 0 {
-		fmt.Printf("users: %d\n", len(task.users))
-	}
-	for _, u := range task.users {
-		fmt.Printf("    - %s\n", u.Title())
-	}
-	if len(task.lists) != 0 {
-		fmt.Printf("lists: %d\n", len(task.lists))
-	}
-	for _, l := range task.lists {
-		fmt.Printf("    - %s\n", l.Title())
-	}
-}
-
 // resolveTarget looks up one target and records the outcome. It returns nil for
 // any account that cannot be used, so that one suspended account never stops the
 // rest of the list from being crawled.
