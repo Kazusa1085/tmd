@@ -235,8 +235,24 @@ docker run --rm \
 | `/state` | 数据库、失败重试队列 | **本地卷**（SQLite 需要可靠文件锁） |
 | `/data` | 媒体文件 | 可以放共享，`conf.yaml` 里 `root_path` 指向它 |
 
-`config/` 目录下有完整的示例配置与 compose 文件。相关环境变量：`TMD_CONFIG_DIR`
-（配置目录，镜像里默认 `/config`）、`TZ`（日志时区）。
+**挂载就是配置。** 镜像预设了 `TMD_ROOT_PATH=/data`、`TMD_STATE_PATH=/state`、
+`TMD_CONFIG_DIR=/config`，所以 `conf.yaml` 里**可以不写 `root_path` / `state_path`**，
+程序会直接使用挂载点。若 `conf.yaml` 里显式写了，则以文件为准。
+
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `TMD_CONFIG_DIR` | `/config` | 配置目录（conf.yaml、targets.yaml、日志、报告） |
+| `TMD_ROOT_PATH` | `/data` | 媒体根目录（`conf.yaml` 未写 `root_path` 时生效） |
+| `TMD_STATE_PATH` | `/state` | 数据库与重试队列（`conf.yaml` 未写 `state_path` 时生效） |
+| `TZ` | `UTC` | 日志时区 |
+
+容器启动时会做几项检查，失败即退出并说明怎么修，避免"看起来成功、实际丢数据"：
+
+- **没挂媒体卷直接拒绝启动**：否则媒体会写进容器内部，容器一退就没了；
+- 配置目录/媒体目录/状态目录不可写时，报出当前 uid 并给两种解法；
+- 没挂状态卷时给出警告（水位线不落盘 → 每次都会重新下载全部）。
+
+`config/` 目录下有完整的示例配置与 compose 文件。
 
 ## Detail
 

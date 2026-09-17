@@ -287,6 +287,31 @@ type storePath struct {
 	errorj string
 }
 
+// applyPathOverrides lets the environment fill in the two paths the
+// configuration file may leave unspecified.
+//
+// The container image mounts /data and /state, and a mounted directory that the
+// program ignores is worse than no mount at all: media written inside the
+// container disappears with it, and a database written into the media volume
+// defeats the point of separating them. A value in conf.yaml still wins, so an
+// explicit configuration is never silently overridden -- but leaving the key out
+// now means "use the mount", not "use /data/.data".
+func applyPathOverrides(rootPath, statePath, confPath string) (string, string) {
+	if rootPath == "" {
+		if v := os.Getenv("TMD_ROOT_PATH"); v != "" {
+			log.Infof("root_path is not set in %s; using TMD_ROOT_PATH=%s", confPath, v)
+			rootPath = v
+		}
+	}
+	if statePath == "" {
+		if v := os.Getenv("TMD_STATE_PATH"); v != "" {
+			log.Infof("state_path is not set in %s; using TMD_STATE_PATH=%s", confPath, v)
+			statePath = v
+		}
+	}
+	return rootPath, statePath
+}
+
 // newStorePath lays out the media root and the state directory and verifies
 // that both can actually be written to. Failing here, with the offending path
 // and the current UID, is far easier to act on than a permission error surfacing
@@ -453,6 +478,13 @@ func run() int {
 		return report.ExitOK
 	}
 	log.Infoln("config is loaded")
+
+	// Environment overrides, applied only where the configuration file left the
+	// choice open. In a container the mounts are the contract: a container that
+	// mounted /data but wrote the media inside itself would lose everything on
+	// exit, and a mounted /state that the database ignores is a wasted mount.
+	conf.RootPath, conf.StatePath = applyPathOverrides(conf.RootPath, conf.StatePath, confPath)
+
 	if conf.MaxDownloadRoutine > 0 {
 		downloading.MaxDownloadRoutine = conf.MaxDownloadRoutine
 	}

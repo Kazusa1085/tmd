@@ -41,7 +41,13 @@ RUN mkdir -p /config /state /data \
     && useradd --uid 1000 --create-home --shell /usr/sbin/nologin tmd \
     && chown -R tmd:tmd /config /state /data
 
+# The three mount points. TMD_ROOT_PATH and TMD_STATE_PATH are what make the
+# mounts authoritative: if conf.yaml omits root_path or state_path, these win,
+# so a mounted /data is where the media really goes instead of inside the
+# container. A value in conf.yaml still takes precedence.
 ENV TMD_CONFIG_DIR=/config \
+    TMD_ROOT_PATH=/data \
+    TMD_STATE_PATH=/state \
     TZ=UTC
 
 WORKDIR /data

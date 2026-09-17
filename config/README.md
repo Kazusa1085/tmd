@@ -14,6 +14,17 @@
 | `additional_cookies.example.yaml` | 可选:备用 cookie,提升拉取速度 | `additional_cookies.yaml` |
 | `docker-compose.example.yml` | NAS/Docker 部署 | `docker-compose.yml` |
 
+## 三个挂载点与环境变量
+
+| 挂载点 | 环境变量（镜像已预设） | 内容 |
+|---|---|---|
+| `/config` | `TMD_CONFIG_DIR` | conf.yaml、targets.yaml、日志、报告 |
+| `/data` | `TMD_ROOT_PATH` | 媒体文件 |
+| `/state` | `TMD_STATE_PATH` | 数据库、失败重试队列 |
+
+`conf.yaml` 里的 `root_path` / `state_path` 若显式填写，**优先级高于环境变量**；
+不写则用上面的挂载点。所以容器场景下最省事的写法是在 `conf.yaml` 里**只留 cookie**。
+
 ## 三个目录的分工
 
 ```
