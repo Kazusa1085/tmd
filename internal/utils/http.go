@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -41,9 +42,11 @@ func (err *HttpStatusError) Error() string {
 }
 
 func IsStatusCode(err error, code int) bool {
-	e, ok := err.(*HttpStatusError)
-	if !ok {
-		return false
+	// Traverse wrapped errors: callers add context with fmt.Errorf("%w") and
+	// still expect to classify the underlying HTTP status.
+	var e *HttpStatusError
+	if errors.As(err, &e) {
+		return e.Code == code
 	}
-	return e.Code == code
+	return false
 }

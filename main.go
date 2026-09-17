@@ -23,6 +23,8 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/unkmonster/tmd/internal/database"
 	"github.com/unkmonster/tmd/internal/downloading"
+	"github.com/unkmonster/tmd/internal/report"
+	"github.com/unkmonster/tmd/internal/targets"
 	"github.com/unkmonster/tmd/internal/twitter"
 	"github.com/unkmonster/tmd/internal/utils"
 	"gopkg.in/yaml.v3"
@@ -42,6 +44,26 @@ type Config struct {
 type userArgs struct {
 	id         []uint64
 	screenName []string
+}
+
+// configDir is where conf.yaml, additional_cookies.yaml, the target list and
+// the reports live. It is a variable so that a container can point it at a
+// mounted volume via TMD_CONFIG_DIR.
+var configDir string
+
+// targetsPath is the target list to read, if any. Empty means "none".
+var targetsPath string
+
+// targetOrder records the requested targets in input order, so the report can
+// name an account even when it was never resolved.
+var targetOrder []targets.Target
+
+// targetReport accumulates per-account outcomes for targets_report.tsv.
+var targetReport = report.New()
+
+// configPath resolves a file inside the configuration directory.
+func configPath(name string) string {
+	return filepath.Join(configDir, name)
 }
 
 func (u *userArgs) GetUser(ctx context.Context, client *resty.Client) ([]*twitter.User, error) {
@@ -141,17 +163,92 @@ func printTask(task *Task) {
 	}
 }
 
+// resolveTarget looks up one target and records the outcome. It returns nil for
+// any account that cannot be used, so that one suspended account never stops the
+// rest of the list from being crawled.
+func resolveTarget(ctx context.Context, client *resty.Client, t targets.Target) *twitter.User {
+	label := t.Label()
+
+	var (
+		user *twitter.User
+		err  error
+	)
+	if t.Kind == targets.KindUserID {
+		id, parseErr := strconv.ParseUint(t.Value, 10, 64)
+		if parseErr != nil {
+			err = fmt.Errorf("invalid user id %q: %w", t.Value, parseErr)
+		} else {
+			user, err = twitter.GetUserById(ctx, client, id)
+		}
+	} else {
+		user, err = twitter.GetUserByScreenName(ctx, client, t.Value)
+	}
+
+	if err != nil {
+		reason := targets.Classify(err)
+		if reason.Certain() {
+			log.Warnf("skipping %s: %s", label, reason)
+			targetReport.Skipped(label, t.Value, reason, err.Error())
+		} else {
+			log.Errorf("could not resolve %s (%s), skipping: %v", label, reason, err)
+			targetReport.Failed(label, t.Value, reason, err)
+		}
+		return nil
+	}
+
+	// Expected, definitive reasons to skip an account outright.
+	if user.Blocking || user.Muting {
+		log.Warnf("skipping %s: blocked or muted", label)
+		targetReport.Skipped(label, t.Value, targets.ReasonBlocked, "blocked or muted")
+		return nil
+	}
+	if user.IsProtected && user.Followstate != twitter.FS_FOLLOWING {
+		log.Warnf("skipping %s: protected and not followed", label)
+		targetReport.Skipped(label, t.Value, targets.ReasonProtected, "protected and not followed")
+		return nil
+	}
+
+	if label != user.Title() {
+		log.Infof("resolved %s -> %s", label, user.Title())
+	}
+	return user
+}
+
+// MakeTask collects what to crawl. Failures are per-target: the returned error
+// is reserved for problems that make the whole run meaningless.
 func MakeTask(ctx context.Context, client *resty.Client, usrArgs userArgs, listArgs ListArgs, follArgs userArgs) (*Task, error) {
 	task := Task{}
 	task.users = make([]*twitter.User, 0)
 	task.lists = make([]twitter.ListBase, 0)
 
-	users, err := usrArgs.GetUser(ctx, client)
+	// 1. Accounts from the target list file, if one is present.
+	fileTargets, err := targets.ParseFile(targetsPath)
 	if err != nil {
 		return nil, err
 	}
-	task.users = append(task.users, users...)
+	if len(fileTargets) != 0 {
+		log.Infof("loaded %d targets from %s", len(fileTargets), targetsPath)
+	}
+	targetOrder = append(targetOrder, fileTargets...)
 
+	// 2. Accounts from the command line, merged with the file.
+	for _, id := range usrArgs.id {
+		targetOrder = append(targetOrder, targets.Target{Kind: targets.KindUserID, Value: strconv.FormatUint(id, 10)})
+	}
+	for _, name := range usrArgs.screenName {
+		targetOrder = append(targetOrder, targets.Target{Kind: targets.KindScreenName, Value: name})
+	}
+	// The same account may be named twice (file and command line, or both an id
+	// and a handle); crawling it twice would only duplicate work.
+	targetOrder = targets.Dedupe(targetOrder)
+
+	for _, t := range targetOrder {
+		if user := resolveTarget(ctx, client, t); user != nil {
+			task.users = append(task.users, user)
+		}
+	}
+
+	// 3. Lists are addressed by id and can only be validated by fetching them.
 	lists, err := listArgs.GetList(ctx, client)
 	if err != nil {
 		return nil, err
@@ -160,14 +257,25 @@ func MakeTask(ctx context.Context, client *resty.Client, usrArgs userArgs, listA
 		task.lists = append(task.lists, list)
 	}
 
-	// fo
-	users, err = follArgs.GetUser(ctx, client)
-	if err != nil {
-		return nil, err
-	}
-	for _, user := range users {
+	// 4. Following lists of the named accounts. A failure here is per-account:
+	// skip it and keep the other lists.
+	for _, id := range follArgs.id {
+		user, err := twitter.GetUserById(ctx, client, id)
+		if err != nil {
+			log.Errorf("could not resolve the following list of %d, skipping: %v", id, err)
+			continue
+		}
 		task.lists = append(task.lists, user.Following())
 	}
+	for _, screenName := range follArgs.screenName {
+		user, err := twitter.GetUserByScreenName(ctx, client, screenName)
+		if err != nil {
+			log.Errorf("could not resolve the following list of %s, skipping: %v", screenName, err)
+			continue
+		}
+		task.lists = append(task.lists, user.Following())
+	}
+
 	return &task, nil
 }
 
@@ -221,7 +329,7 @@ func initLogger(dbg bool, logFile io.Writer) {
 	log.AddHook(lfshook.NewHook(logFile, nil))
 }
 
-func main() {
+func run() int {
 	//flags
 	var usrArgs userArgs
 	var listArgs ListArgs
@@ -238,12 +346,16 @@ func main() {
 	flag.BoolVar(&dbg, "dbg", false, "display debug message")
 	flag.BoolVar(&autoFollow, "auto-follow", false, "send follow request automatically to protected users")
 	flag.BoolVar(&noRetry, "no-retry", false, "quickly exit without retrying failed tweets")
+	flag.StringVar(&targetsPath, "targets", "", "read the list of users to crawl from this file (default: <config dir>/targets.yaml)")
 	flag.Parse()
 
 	var err error
 
 	// context
 	ctx, cancel := context.WithCancel(context.Background())
+	// Releasing it on every exit path keeps go vet's lostcancel check quiet and
+	// lets the defers below run instead of being skipped by a bare return.
+	defer cancel()
 
 	var homepath string
 	if runtime.GOOS == "windows" {
@@ -255,7 +367,20 @@ func main() {
 		panic("failed to get home path from env")
 	}
 
-	appRootPath := filepath.Join(homepath, ".tmd2")
+	// The configuration directory may be redirected so that a container can
+	// keep conf.yaml and the cookies on a mounted volume. Defaults to the
+	// historical location.
+	appRootPath := os.Getenv("TMD_CONFIG_DIR")
+	if appRootPath == "" {
+		appRootPath = filepath.Join(homepath, ".tmd2")
+	}
+	if abs, err := filepath.Abs(appRootPath); err == nil {
+		appRootPath = abs
+	}
+	configDir = appRootPath
+	if targetsPath == "" {
+		targetsPath = configPath("targets.yaml")
+	}
 	confPath := filepath.Join(appRootPath, "conf.yaml")
 	cliLogPath := filepath.Join(appRootPath, "client.log")
 	logPath := filepath.Join(appRootPath, "tmd2.log")
@@ -269,8 +394,17 @@ func main() {
 	if err != nil {
 		log.Fatalln("failed to create log file:", err)
 	}
-	defer logFile.Close()
 	initLogger(dbg, logFile)
+
+	// The target report is part of the run's contract: it is written no matter
+	// how the run ends, so a skipped account is never silently invisible. It is
+	// registered after the logger but closes the log file itself, which makes
+	// the ordering explicit instead of depending on where this defer sits
+	// relative to logFile.Close().
+	defer func() {
+		writeTargetReport()
+		_ = logFile.Close()
+	}()
 
 	// report at exit
 	defer func() {
@@ -292,7 +426,7 @@ func main() {
 	}
 	if confArg {
 		log.Println("config done")
-		return
+		return report.ExitOK
 	}
 	log.Infoln("config is loaded")
 	if conf.MaxDownloadRoutine > 0 {
@@ -410,15 +544,85 @@ func main() {
 
 	// do job
 	if len(task.users) == 0 && len(task.lists) == 0 {
-		return
+		log.Warnln("nothing to do: no usable targets")
+		printTargetSummary()
+		// Let the report decide: every target failing with an auth error is an
+		// expired cookie (exit 3), other failures exit 1. Only a list that named
+		// nothing usable at all is a usage problem.
+		if targetReport.Len() != 0 {
+			return targetReport.ExitCode()
+		}
+		if len(targetOrder) == 0 {
+			return report.ExitOK // nothing was asked for
+		}
+		return report.ExitUsage
 	}
-	log.Infoln("start working for...")
-	printTask(task)
+	log.Infof("start working for: %d user(s), %d list(s)", len(task.users), len(task.lists))
 
 	todump, err = downloading.BatchDownloadAny(ctx, client, db, task.lists, task.users, pathHelper.root, pathHelper.users, autoFollow, addtional)
 	if err != nil {
 		log.Errorln("failed to download:", err)
 	}
+
+	// One outcome per target, so a skipped account can never look like a
+	// crawled one.
+	failedByUser := make(map[string]int, len(todump))
+	for _, item := range todump {
+		name := item.Entity.Name()
+		failedByUser[name]++
+	}
+	for _, t := range targetOrder {
+		if targetReport.Has(t.Label()) {
+			continue // already recorded as unresolved or skipped
+		}
+		if failed := failedByUser[t.Label()]; failed != 0 {
+			targetReport.Failed(t.Label(), t.Value, targets.ReasonUnknown,
+				fmt.Errorf("%d tweet(s) failed to download and were queued for retry", failed))
+			continue
+		}
+		targetReport.OK(t.Label(), t.Value, 0)
+	}
+
+	return targetReport.ExitCode()
+}
+
+// printTargetSummary prints the requested targets, so the console shows the same
+// picture as the report file.
+func printTargetSummary() {
+	if len(targetOrder) == 0 {
+		return
+	}
+	fmt.Printf("targets: %d requested\n", len(targetOrder))
+	for _, t := range targetOrder {
+		fmt.Printf("    - %s\n", t.Label())
+	}
+}
+
+// writeTargetReport persists the per-account outcomes and prints a summary. A
+// failure to write is loud but not fatal: the exit code still reflects whether
+// the crawl itself was complete.
+func writeTargetReport() {
+	if targetReport.Len() == 0 {
+		return
+	}
+
+	path, err := targetReport.Write(configDir)
+	if err != nil {
+		log.Errorln("failed to write the target report:", err)
+	}
+
+	ok, skipped, failed := targetReport.Counts()
+	log.Infof("targets: %d ok, %d skipped, %d failed", ok, skipped, failed)
+	if path != "" {
+		log.Infoln("target report:", path)
+	}
+	if accounts := targetReport.FailedAccounts(); len(accounts) != 0 {
+		log.Warnf("could not crawl %d account(s): %s", len(accounts), strings.Join(accounts, ", "))
+	}
+}
+
+func main() {
+	os.Exit(run())
 }
 
 // loadRetryQueue loads the persisted retry queue. A queue damaged by an earlier
