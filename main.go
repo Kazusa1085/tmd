@@ -364,10 +364,23 @@ func checkWritable(dir string) error {
 }
 
 func initLogger(dbg bool, logFile io.Writer) {
-	log.SetFormatter(&log.TextFormatter{
-		ForceColors:   true,
+	// ForceColors writes ANSI escapes into the log file as well as the terminal,
+	// which turns every container or cron log into escape soup. Respect the
+	// conventional NO_COLOR (and TERM=dumb) so unattended runs produce a plain,
+	// greppable log.
+	noColor := os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb"
+
+	formatter := &log.TextFormatter{
+		ForceColors:   !noColor,
 		FullTimestamp: true,
-	})
+	}
+	if noColor {
+		// The file hook needs an explicit non-colour formatter: lfshook follows
+		// the logger's formatter otherwise, and ForceColors=false is not enough
+		// to keep colour out of a redirected stream.
+		formatter.DisableColors = true
+	}
+	log.SetFormatter(formatter)
 
 	if dbg {
 		log.SetLevel(log.DebugLevel)
@@ -375,6 +388,13 @@ func initLogger(dbg bool, logFile io.Writer) {
 		log.SetLevel(log.InfoLevel)
 	}
 
+	if noColor {
+		log.AddHook(lfshook.NewHook(logFile, &log.TextFormatter{
+			FullTimestamp: true,
+			DisableColors: true,
+		}))
+		return
+	}
 	log.AddHook(lfshook.NewHook(logFile, nil))
 }
 
