@@ -75,6 +75,13 @@ func writeMediaFileAtomically(path string, body io.Reader, createdAt time.Time) 
 	// file becomes visible at its final path.
 	_ = os.Chtimes(tempPath, time.Time{}, createdAt)
 
+	// CreateTemp makes the file 0600 and a rename carries that over, which left
+	// downloaded media unreadable to anyone but the owner (and, under a typical
+	// umask, an odd mode in the listing). Media are data, not programs.
+	if err := os.Chmod(tempPath, 0644); err != nil {
+		return "", err
+	}
+
 	mutex.Lock()
 	defer mutex.Unlock()
 
